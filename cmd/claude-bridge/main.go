@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -141,8 +142,16 @@ type claudeJSONResult struct {
 }
 
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// Capture raw body for streaming detection + debug logging.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, 400, "invalid_request", "could not read body: "+err.Error())
+		return
+	}
+	r.Body.Close()
+
 	var req openAIRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, 400, "invalid_request", "could not parse JSON body: "+err.Error())
 		return
 	}
@@ -150,6 +159,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request", "messages array is required and non-empty")
 		return
 	}
+
+	log.Printf("[claude-bridge] inbound: model=%q stream=%v msgs=%d tools=%d",
+		req.Model, req.Stream, len(req.Messages), len(req.Tools))
 
 	model := req.Model
 	if model == "" {
@@ -224,11 +236,90 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	log.Printf("[claude-bridge] %s: in=%d out=%d cost=$%.4f stop=%s",
+	log.Printf("[claude-bridge] %s: in=%d out=%d cost=$%.4f stop=%s stream=%v",
 		model, result.Usage.InputTokens, result.Usage.OutputTokens,
-		result.TotalCostUSD, result.StopReason)
+		result.TotalCostUSD, result.StopReason, req.Stream)
 
+	if req.Stream {
+		writeSSE(w, model, result)
+		return
+	}
 	writeJSON(w, 200, resp)
+}
+
+// writeSSE returns the response as an OpenAI streaming SSE payload. We don't
+// stream incrementally (the claude CLI delivers in one shot via --output-format
+// json), so we emit a single content delta then a finish chunk then [DONE].
+// That's enough for the OpenAI Python SDK to parse and assemble the response.
+func writeSSE(w http.ResponseWriter, model string, result claudeJSONResult) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(200)
+	flusher, _ := w.(http.Flusher)
+
+	id := "chatcmpl-" + result.SessionID
+	created := time.Now().Unix()
+
+	// First chunk: role marker (no content yet, just declares the assistant turn)
+	emit := func(payload map[string]any) {
+		b, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	emit(map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{"role": "assistant"},
+			"finish_reason": nil,
+		}},
+	})
+
+	// Second chunk: the full content as a single delta. We could chunk this
+	// but the OpenAI SDK concatenates deltas; one big chunk is correct.
+	emit(map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{"content": result.Result},
+			"finish_reason": nil,
+		}},
+	})
+
+	// Final chunk: empty delta with finish_reason set.
+	emit(map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": mapStopReason(result.StopReason),
+		}},
+		// Some clients (Hermes included) read usage on the terminating chunk.
+		"usage": map[string]any{
+			"prompt_tokens":     result.Usage.InputTokens,
+			"completion_tokens": result.Usage.OutputTokens,
+			"total_tokens":      result.Usage.InputTokens + result.Usage.OutputTokens,
+		},
+	})
+
+	// SSE terminator the OpenAI SDK looks for.
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 func flattenMessages(msgs []openAIMessage) (system, prompt string) {
