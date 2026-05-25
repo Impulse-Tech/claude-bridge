@@ -48,11 +48,32 @@ func main() {
 	if claudeBin == "" {
 		log.Fatalf("[claude-bridge] could not locate `claude` binary. Set CLAUDE_BIN=/path/to/claude or install Claude Code.")
 	}
+
+	// Claude CLI gates filesystem access. Without --add-dir, it can only
+	// read its CWD — so vault search, project introspection, etc. all
+	// fail with "needs permission" prompts. We grant access up-front to
+	// directories the user explicitly trusts.
+	//
+	// Default set: home, vault, hermes config, goprojects workspace.
+	// Override or extend with CLAUDE_ALLOWED_DIRS (colon-separated).
+	// Set CLAUDE_BYPASS_PERMISSIONS=true to skip the dir list entirely
+	// (uses --dangerously-skip-permissions — only safe when bridge is
+	// localhost-bound, which it is by default).
+	allowedDirs := parseAllowedDirs()
+	bypassPerms := strings.EqualFold(os.Getenv("CLAUDE_BYPASS_PERMISSIONS"), "true")
+
 	log.Printf("[claude-bridge] using claude binary: %s", claudeBin)
+	if bypassPerms {
+		log.Printf("[claude-bridge] permission mode: BYPASS (--dangerously-skip-permissions)")
+	} else {
+		log.Printf("[claude-bridge] allowed dirs: %v", allowedDirs)
+	}
 
 	srv := &server{
 		claudeBin:    claudeBin,
 		defaultModel: defaultModel,
+		allowedDirs:  allowedDirs,
+		bypassPerms:  bypassPerms,
 	}
 
 	mux := http.NewServeMux()
@@ -85,6 +106,8 @@ func main() {
 type server struct {
 	claudeBin    string
 	defaultModel string
+	allowedDirs  []string
+	bypassPerms  bool
 }
 
 func (s *server) root(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +201,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if systemPrompt != "" {
 		args = append(args, "--append-system-prompt", systemPrompt)
+	}
+	if s.bypassPerms {
+		args = append(args, "--dangerously-skip-permissions")
+	} else {
+		for _, d := range s.allowedDirs {
+			args = append(args, "--add-dir", d)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
@@ -402,6 +432,42 @@ func envDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseAllowedDirs builds the list of directories claude is permitted to
+// read via --add-dir. Sources, in priority order:
+//
+//  1. CLAUDE_ALLOWED_DIRS env var (colon-separated) — explicit override.
+//  2. A built-in default list: $HOME/Documents, $HOME/.hermes, $HOME/goprojects.
+//
+// Any path that doesn't exist on disk is silently dropped (claude rejects
+// non-existent paths). $HOME and ~ are expanded.
+func parseAllowedDirs() []string {
+	home, _ := os.UserHomeDir()
+	var raw []string
+	if env := os.Getenv("CLAUDE_ALLOWED_DIRS"); env != "" {
+		raw = strings.Split(env, ":")
+	} else {
+		raw = []string{
+			home + "/Documents",
+			home + "/.hermes",
+			home + "/goprojects",
+		}
+	}
+	var out []string
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "~") {
+			p = home + p[1:]
+		}
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func findClaudeBin() string {
