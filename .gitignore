@@ -1,3 +1,14 @@
+# Binary
 /claude-bridge
-*.log
+
+# Local config — never commit
 .env
+.env.local
+
+# Logs
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
