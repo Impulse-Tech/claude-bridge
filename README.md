@@ -168,6 +168,20 @@ print(resp.choices[0].message.content)
 
 ### Wire into [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 
+**Easiest path — use the companion plugin:**
+
+There's a small Hermes plugin that registers a first-class `claude-cli` provider so the bridge shows up in `hermes model` next to Anthropic, OpenRouter, etc. — no manual config editing required.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/niski84/hermes-claude-cli/main/scripts/install.sh | bash
+```
+
+That installer handles claude-bridge + the Hermes plugin + a systemd unit in one shot. After it finishes, run `hermes model` and pick "Claude CLI (Max subscription)". Repo: **[niski84/hermes-claude-cli](https://github.com/niski84/hermes-claude-cli)**.
+
+There's also an [upstream PR pending](https://github.com/NousResearch/hermes-agent/pull/31796) to ship the provider as part of Hermes core — if it merges, future Hermes users get the picker entry for free and only need to install claude-bridge.
+
+**Manual path — edit config directly:**
+
 In `~/.hermes/config.yaml`:
 
 ```yaml
@@ -178,7 +192,7 @@ model:
   api_key: bridge   # any non-empty string
 ```
 
-Then `systemctl --user restart hermes-gateway`. Hermes is now powered by your Claude subscription.
+Then `systemctl --user restart hermes-gateway`. Hermes is now powered by your Claude subscription. (This works but you won't see "Claude CLI" labeled in `hermes model` — the picker only labels named providers.)
 
 ### Wire into Open WebUI
 
