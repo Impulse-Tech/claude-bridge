@@ -80,6 +80,7 @@ func main() {
 	mux.HandleFunc("GET /api/health", srv.health)
 	mux.HandleFunc("GET /v1/models", srv.models)
 	mux.HandleFunc("POST /v1/chat/completions", srv.chatCompletions)
+	mux.HandleFunc("POST /v1/responses", srv.responses)
 	mux.HandleFunc("GET /", srv.root)
 
 	httpSrv := &http.Server{Addr: ":" + port, Handler: mux}
@@ -279,6 +280,116 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Stream {
 		writeSSE(w, model, result)
 		return
+	}
+	writeJSON(w, 200, resp)
+}
+
+// responses handles POST /v1/responses (OpenAI Responses API format).
+// OpenClaw uses this endpoint for custom providers. We translate input→messages,
+// reuse the same claude -p subprocess, then reformat the result.
+func (s *server) responses(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, 400, "invalid_request", "could not read body: "+err.Error())
+		return
+	}
+	r.Body.Close()
+
+	// Responses API uses "input" instead of "messages" but same item shape.
+	var raw struct {
+		Model  string           `json:"model"`
+		Input  []openAIMessage  `json:"input"`
+		Stream bool             `json:"stream,omitempty"`
+	}
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		writeError(w, 400, "invalid_request", "could not parse JSON body: "+err.Error())
+		return
+	}
+	if len(raw.Input) == 0 {
+		writeError(w, 400, "invalid_request", "input array is required and non-empty")
+		return
+	}
+
+	model := raw.Model
+	if model == "" {
+		model = s.defaultModel
+	}
+
+	log.Printf("[claude-bridge] inbound(responses): model=%q stream=%v msgs=%d",
+		model, raw.Stream, len(raw.Input))
+
+	systemPrompt, userPrompt := flattenMessages(raw.Input)
+
+	args := []string{"-p", "--print", "--output-format", "json", "--model", model}
+	if systemPrompt != "" {
+		args = append(args, "--append-system-prompt", systemPrompt)
+	}
+	if s.bypassPerms {
+		args = append(args, "--dangerously-skip-permissions")
+	} else {
+		for _, d := range s.allowedDirs {
+			args = append(args, "--add-dir", d)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
+	if override := os.Getenv("CLAUDE_OAUTH_TOKEN_OVERRIDE"); override != "" {
+		cmd.Env = append(os.Environ(),
+			"CLAUDE_CODE_OAUTH_TOKEN="+override,
+			"ANTHROPIC_OAUTH_TOKEN="+override,
+		)
+	}
+	cmd.Stdin = strings.NewReader(userPrompt)
+
+	out, err := cmd.Output()
+	if err != nil {
+		stderr := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = string(ee.Stderr)
+		}
+		log.Printf("[claude-bridge] claude failed: %v stderr=%q", err, stderr)
+		writeError(w, 502, "upstream_error",
+			fmt.Sprintf("claude CLI failed: %v — stderr: %s", err, stderr))
+		return
+	}
+
+	var result claudeJSONResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		writeError(w, 502, "parse_error", "claude output was not valid JSON: "+err.Error())
+		return
+	}
+	if result.IsError {
+		writeError(w, 502, "claude_error", "claude returned error: "+result.Subtype)
+		return
+	}
+
+	log.Printf("[claude-bridge] %s(responses): in=%d out=%d cost=$%.4f stop=%s",
+		model, result.Usage.InputTokens, result.Usage.OutputTokens,
+		result.TotalCostUSD, result.StopReason)
+
+	resp := map[string]any{
+		"id":         "resp-" + result.SessionID,
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"model":      model,
+		"output": []map[string]any{
+			{
+				"type": "message",
+				"id":   "msg-" + result.SessionID,
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "output_text", "text": result.Result},
+				},
+			},
+		},
+		"usage": map[string]any{
+			"input_tokens":  result.Usage.InputTokens,
+			"output_tokens": result.Usage.OutputTokens,
+			"total_tokens":  result.Usage.InputTokens + result.Usage.OutputTokens,
+		},
 	}
 	writeJSON(w, 200, resp)
 }
