@@ -7,25 +7,27 @@
 // response out. Hermes never knows it's talking to a CLI.
 //
 // What it supports:
-//   POST /v1/chat/completions  — non-streaming. Translates Hermes messages
-//                                into a single prompt + system prompt and
-//                                runs `claude -p --output-format json`.
-//   GET  /v1/models            — static list (sonnet, opus, haiku).
-//   GET  /api/health           — process health.
 //
-// What it doesn't do (yet):
-//   - Streaming. Hermes accepts non-streaming responses fine but UX is
-//     slower. Add later via `--output-format stream-json`.
+//	POST /v1/chat/completions  — streaming and non-streaming. Translates
+//	                             OpenAI messages into a prompt and runs
+//	                             `claude -p --output-format json`. For
+//	                             stream=true, SSE keepalive comments are
+//	                             sent every 30s while claude runs so the
+//	                             client idle-timeout doesn't fire first.
+//	POST /v1/responses         — OpenAI Responses API format (same behaviour).
+//	GET  /v1/models            — static list (sonnet, opus, haiku).
+//	GET  /api/health           — process health.
+//
+// What it doesn't do:
 //   - Tool calls. The `claude` CLI doesn't accept tool definitions from
 //     callers — it has its own built-in tools. Any `tools:` array in the
-//     incoming request is dropped at the wire. Hermes won't see tool_calls
-//     in responses. (Workaround: claude's own Read/Grep tools can search
-//     the vault directly when prompted to.)
+//     incoming request is dropped at the wire.
 //   - Auth. The shim trusts its localhost binding. Anyone who can reach
 //     the port can spend your Claude subscription. Don't expose it.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -83,7 +85,11 @@ func main() {
 	mux.HandleFunc("POST /v1/responses", srv.responses)
 	mux.HandleFunc("GET /", srv.root)
 
-	httpSrv := &http.Server{Addr: ":" + port, Handler: mux}
+	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[claude-bridge] request: %s %s", r.Method, r.URL.Path)
+		mux.ServeHTTP(w, r)
+	})
+	httpSrv := &http.Server{Addr: ":" + port, Handler: logged}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -112,7 +118,7 @@ type server struct {
 }
 
 func (s *server) root(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "claude-bridge — OpenAI shim over Claude CLI\n\nEndpoints:\n  GET  /api/health\n  GET  /v1/models\n  POST /v1/chat/completions\n")
+	fmt.Fprintf(w, "claude-bridge — OpenAI shim over Claude CLI\n\nEndpoints:\n  GET  /api/health\n  GET  /v1/models\n  POST /v1/chat/completions\n  POST /v1/responses\n")
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +143,7 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
 
-// ─── chat completions ──────────────────────────────────────────────────
+// ─── types ─────────────────────────────────────────────────────────────
 
 type openAIRequest struct {
 	Model    string          `json:"model"`
@@ -165,8 +171,9 @@ type claudeJSONResult struct {
 	} `json:"usage"`
 }
 
+// ─── chat completions ──────────────────────────────────────────────────
+
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	// Capture raw body for streaming detection + debug logging.
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, 400, "invalid_request", "could not read body: "+err.Error())
@@ -214,13 +221,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
-	if override := os.Getenv("CLAUDE_OAUTH_TOKEN_OVERRIDE"); override != "" {
-		cmd.Env = append(os.Environ(),
-			"CLAUDE_CODE_OAUTH_TOKEN="+override,
-			"ANTHROPIC_OAUTH_TOKEN="+override,
-		)
+	if req.Stream {
+		s.runClaudeStreaming(w, ctx, args, userPrompt, model)
+		return
 	}
+
+	// Non-streaming: block until claude finishes, then respond with JSON.
+	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
+	s.applyTokenOverride(cmd)
 	cmd.Stdin = strings.NewReader(userPrompt)
 
 	out, err := cmd.Output()
@@ -246,7 +254,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := map[string]any{
+	log.Printf("[claude-bridge] %s: in=%d out=%d cost=$%.4f stop=%s stream=false",
+		model, result.Usage.InputTokens, result.Usage.OutputTokens,
+		result.TotalCostUSD, result.StopReason)
+
+	writeJSON(w, 200, map[string]any{
 		"id":      "chatcmpl-" + result.SessionID,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
@@ -271,22 +283,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			"session_id":  result.SessionID,
 			"stop_reason": result.StopReason,
 		},
-	}
-
-	log.Printf("[claude-bridge] %s: in=%d out=%d cost=$%.4f stop=%s stream=%v",
-		model, result.Usage.InputTokens, result.Usage.OutputTokens,
-		result.TotalCostUSD, result.StopReason, req.Stream)
-
-	if req.Stream {
-		writeSSE(w, model, result)
-		return
-	}
-	writeJSON(w, 200, resp)
+	})
 }
 
+// ─── responses (OpenAI Responses API) ──────────────────────────────────
+
 // responses handles POST /v1/responses (OpenAI Responses API format).
-// OpenClaw uses this endpoint for custom providers. We translate input→messages,
-// reuse the same claude -p subprocess, then reformat the result.
+// OpenClaw generates this endpoint for custom providers whose api type is
+// "openai-responses". We translate input→messages, reuse the same claude -p
+// subprocess path, then reformat the result.
 func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -295,11 +300,10 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
-	// Responses API uses "input" instead of "messages" but same item shape.
 	var raw struct {
-		Model  string           `json:"model"`
-		Input  []openAIMessage  `json:"input"`
-		Stream bool             `json:"stream,omitempty"`
+		Model  string          `json:"model"`
+		Input  []openAIMessage `json:"input"`
+		Stream bool            `json:"stream,omitempty"`
 	}
 	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
 		writeError(w, 400, "invalid_request", "could not parse JSON body: "+err.Error())
@@ -335,13 +339,14 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
-	if override := os.Getenv("CLAUDE_OAUTH_TOKEN_OVERRIDE"); override != "" {
-		cmd.Env = append(os.Environ(),
-			"CLAUDE_CODE_OAUTH_TOKEN="+override,
-			"ANTHROPIC_OAUTH_TOKEN="+override,
-		)
+	if raw.Stream {
+		s.runClaudeStreaming(w, ctx, args, userPrompt, model)
+		return
 	}
+
+	// Non-streaming path.
+	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
+	s.applyTokenOverride(cmd)
 	cmd.Stdin = strings.NewReader(userPrompt)
 
 	out, err := cmd.Output()
@@ -370,7 +375,7 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 		model, result.Usage.InputTokens, result.Usage.OutputTokens,
 		result.TotalCostUSD, result.StopReason)
 
-	resp := map[string]any{
+	writeJSON(w, 200, map[string]any{
 		"id":         "resp-" + result.SessionID,
 		"object":     "response",
 		"created_at": time.Now().Unix(),
@@ -390,25 +395,105 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 			"output_tokens": result.Usage.OutputTokens,
 			"total_tokens":  result.Usage.InputTokens + result.Usage.OutputTokens,
 		},
-	}
-	writeJSON(w, 200, resp)
+	})
 }
 
-// writeSSE returns the response as an OpenAI streaming SSE payload. We don't
-// stream incrementally (the claude CLI delivers in one shot via --output-format
-// json), so we emit a single content delta then a finish chunk then [DONE].
-// That's enough for the OpenAI Python SDK to parse and assemble the response.
-func writeSSE(w http.ResponseWriter, model string, result claudeJSONResult) {
+// ─── streaming ─────────────────────────────────────────────────────────
+
+// runClaudeStreaming handles stream=true for both /v1/chat/completions and
+// /v1/responses. It:
+//  1. Sets SSE headers and flushes immediately (so the client idle timer starts
+//     with bytes already flowing).
+//  2. Starts claude as a subprocess (cmd.Start, not cmd.Output).
+//  3. Sends SSE keepalive comments (": keepalive") every 30 seconds while
+//     waiting. These are invisible to the end user — the SSE spec requires
+//     clients to silently discard comment lines. They prevent OpenClaw's
+//     120-second idle-stream timeout from killing the connection.
+//  4. When claude finishes, emits the full response as OpenAI SSE chunks.
+func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, args []string, userPrompt, model string) {
+	flusher := writeSSEHeaders(w)
+
+	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
+	s.applyTokenOverride(cmd)
+	cmd.Stdin = strings.NewReader(userPrompt)
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[claude-bridge] failed to start claude: %v", err)
+		sseError(w, flusher, "failed to start claude: "+err.Error())
+		return
+	}
+
+	stopKeepalive := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				fmt.Fprint(w, ": keepalive\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+			case <-stopKeepalive:
+				return
+			}
+		}
+	}()
+
+	err := cmd.Wait()
+	close(stopKeepalive)
+
+	if err != nil {
+		stderr := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = string(ee.Stderr)
+		}
+		log.Printf("[claude-bridge] claude failed (stream): %v stderr=%q", err, stderr)
+		sseError(w, flusher, fmt.Sprintf("claude CLI failed: %v — stderr: %s", err, stderr))
+		return
+	}
+
+	var result claudeJSONResult
+	if err := json.Unmarshal(outBuf.Bytes(), &result); err != nil {
+		log.Printf("[claude-bridge] parse error (stream): %v (raw: %s)", err, truncate(outBuf.String(), 500))
+		sseError(w, flusher, "claude output was not valid JSON: "+err.Error())
+		return
+	}
+	if result.IsError {
+		sseError(w, flusher, "claude returned error: "+result.Subtype)
+		return
+	}
+
+	log.Printf("[claude-bridge] %s: in=%d out=%d cost=$%.4f stop=%s stream=true",
+		model, result.Usage.InputTokens, result.Usage.OutputTokens,
+		result.TotalCostUSD, result.StopReason)
+
+	writeSSEChunks(w, flusher, model, result)
+}
+
+// writeSSEHeaders sets SSE response headers, calls WriteHeader(200), flushes,
+// and returns the Flusher. Must be called before starting any subprocess so
+// the initial flush resets the client's idle timer.
+func writeSSEHeaders(w http.ResponseWriter) http.Flusher {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(200)
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	return flusher
+}
 
+// writeSSEChunks emits a claude result as three OpenAI SSE chunks: role marker,
+// content delta, finish chunk with usage. Headers must be set before calling.
+func writeSSEChunks(w http.ResponseWriter, flusher http.Flusher, model string, result claudeJSONResult) {
 	id := "chatcmpl-" + result.SessionID
 	created := time.Now().Unix()
 
-	// First chunk: role marker (no content yet, just declares the assistant turn)
 	emit := func(payload map[string]any) {
 		b, _ := json.Marshal(payload)
 		fmt.Fprintf(w, "data: %s\n\n", b)
@@ -418,43 +503,16 @@ func writeSSE(w http.ResponseWriter, model string, result claudeJSONResult) {
 	}
 
 	emit(map[string]any{
-		"id":      id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
-		"choices": []map[string]any{{
-			"index":         0,
-			"delta":         map[string]any{"role": "assistant"},
-			"finish_reason": nil,
-		}},
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
 	})
-
-	// Second chunk: the full content as a single delta. We could chunk this
-	// but the OpenAI SDK concatenates deltas; one big chunk is correct.
 	emit(map[string]any{
-		"id":      id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
-		"choices": []map[string]any{{
-			"index":         0,
-			"delta":         map[string]any{"content": result.Result},
-			"finish_reason": nil,
-		}},
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": result.Result}, "finish_reason": nil}},
 	})
-
-	// Final chunk: empty delta with finish_reason set.
 	emit(map[string]any{
-		"id":      id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
-		"choices": []map[string]any{{
-			"index":         0,
-			"delta":         map[string]any{},
-			"finish_reason": mapStopReason(result.StopReason),
-		}},
-		// Some clients (Hermes included) read usage on the terminating chunk.
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": mapStopReason(result.StopReason)}},
 		"usage": map[string]any{
 			"prompt_tokens":     result.Usage.InputTokens,
 			"completion_tokens": result.Usage.OutputTokens,
@@ -462,12 +520,38 @@ func writeSSE(w http.ResponseWriter, model string, result claudeJSONResult) {
 		},
 	})
 
-	// SSE terminator the OpenAI SDK looks for.
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()
 	}
 }
+
+// sseError sends an SSE error event followed by [DONE]. Used after headers are
+// already written, so HTTP status codes are no longer available.
+func sseError(w http.ResponseWriter, flusher http.Flusher, msg string) {
+	b, _ := json.Marshal(map[string]any{
+		"error": map[string]any{"message": msg, "type": "server_error"},
+	})
+	fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", b)
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// applyTokenOverride injects CLAUDE_OAUTH_TOKEN_OVERRIDE into cmd.Env when
+// the env var is set. This allows a second bridge instance to use a different
+// OAuth token (e.g. Team plan) without affecting the default instance which
+// inherits its token from ~/.claude.
+func (s *server) applyTokenOverride(cmd *exec.Cmd) {
+	if override := os.Getenv("CLAUDE_OAUTH_TOKEN_OVERRIDE"); override != "" {
+		cmd.Env = append(os.Environ(),
+			"CLAUDE_CODE_OAUTH_TOKEN="+override,
+			"ANTHROPIC_OAUTH_TOKEN="+override,
+		)
+	}
+}
+
+// ─── helpers ───────────────────────────────────────────────────────────
 
 func flattenMessages(msgs []openAIMessage) (system, prompt string) {
 	var sysBuf, transcriptBuf strings.Builder
