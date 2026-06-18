@@ -214,6 +214,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
+	if override := os.Getenv("CLAUDE_OAUTH_TOKEN_OVERRIDE"); override != "" {
+		cmd.Env = append(os.Environ(),
+			"CLAUDE_CODE_OAUTH_TOKEN="+override,
+			"ANTHROPIC_OAUTH_TOKEN="+override,
+		)
+	}
 	cmd.Stdin = strings.NewReader(userPrompt)
 
 	out, err := cmd.Output()
