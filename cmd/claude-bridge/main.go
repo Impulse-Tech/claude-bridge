@@ -405,10 +405,9 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 //  1. Sets SSE headers and flushes immediately (so the client idle timer starts
 //     with bytes already flowing).
 //  2. Starts claude as a subprocess (cmd.Start, not cmd.Output).
-//  3. Sends SSE keepalive comments (": keepalive") every 30 seconds while
-//     waiting. These are invisible to the end user — the SSE spec requires
-//     clients to silently discard comment lines. They prevent OpenClaw's
-//     120-second idle-stream timeout from killing the connection.
+//  3. Sends empty-content delta data events every 30 seconds while waiting.
+//     These reset OpenClaw's 120-second idle-stream timer (comment lines don't).
+//     Empty content deltas produce no visible text in chat.
 //  4. When claude finishes, emits the full response as OpenAI SSE chunks.
 func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, args []string, userPrompt, model string) {
 	flusher := writeSSEHeaders(w)
@@ -432,7 +431,9 @@ func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, 
 		for {
 			select {
 			case <-t.C:
-				fmt.Fprint(w, ": keepalive\n\n")
+				// Send an empty-delta data event (not an SSE comment) so OpenClaw's
+			// 120s idle timer resets on receipt. Empty content delta is invisible in chat.
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
