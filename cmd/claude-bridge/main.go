@@ -466,7 +466,7 @@ func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, 
 			case <-heartbeatDone:
 				return
 			case <-ticker.C:
-				emitChunk(map[string]any{"content": ""})
+				emitChunk(map[string]any{"content": "​"}) // zero-width space: non-empty (resets OpenClaw idle timer), invisible in Discord
 			}
 		}
 	}()
