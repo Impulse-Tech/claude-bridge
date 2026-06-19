@@ -413,7 +413,8 @@ func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, 
 	flusher := writeSSEHeaders(w)
 
 	// Switch to stream-json so tokens arrive in real time.
-	streamArgs := replaceOutputFormat(args, "stream-json")
+	// --verbose is required by newer claude CLI versions when using stream-json with -p.
+	streamArgs := append(replaceOutputFormat(args, "stream-json"), "--verbose")
 
 	cmd := exec.CommandContext(ctx, s.claudeBin, streamArgs...)
 	s.applyTokenOverride(cmd)
