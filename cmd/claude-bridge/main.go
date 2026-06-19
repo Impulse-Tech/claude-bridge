@@ -426,14 +426,17 @@ func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, 
 
 	stopKeepalive := make(chan struct{})
 	go func() {
-		t := time.NewTicker(30 * time.Second)
+		// 23s interval: avoids the race where the 30s tick lands exactly when
+		// OpenClaw's 120s idle timer fires (t=120). With 23s, ticks land at
+		// 23, 46, 69, 92, 115, 138 — the 115s tick resets the timer before 120s.
+		t := time.NewTicker(23 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-t.C:
 				// Send an empty-delta data event (not an SSE comment) so OpenClaw's
-			// 120s idle timer resets on receipt. Empty content delta is invisible in chat.
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n")
+				// 120s idle timer resets on receipt. Empty content delta is invisible in chat.
+				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
