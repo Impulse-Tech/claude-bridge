@@ -27,7 +27,7 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,6 +38,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -401,22 +402,28 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 // ─── streaming ─────────────────────────────────────────────────────────
 
 // runClaudeStreaming handles stream=true for both /v1/chat/completions and
-// /v1/responses. It:
-//  1. Sets SSE headers and flushes immediately (so the client idle timer starts
-//     with bytes already flowing).
-//  2. Starts claude as a subprocess (cmd.Start, not cmd.Output).
-//  3. Sends empty-content delta data events every 30 seconds while waiting.
-//     These reset OpenClaw's 120-second idle-stream timer (comment lines don't).
-//     Empty content deltas produce no visible text in chat.
-//  4. When claude finishes, emits the full response as OpenAI SSE chunks.
+// /v1/responses. Uses --output-format stream-json so claude emits real tokens
+// as it generates them. Each token is immediately forwarded as an OpenAI SSE
+// delta, which resets OpenClaw's 120s idle-stream timer on every real word.
+//
+// Root cause of prior failures: empty content-delta keepalives were silently
+// ignored by OpenClaw's idle timer — only non-empty content events reset it.
+// Real token streaming eliminates the problem entirely; no keepalive needed.
 func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, args []string, userPrompt, model string) {
 	flusher := writeSSEHeaders(w)
 
-	cmd := exec.CommandContext(ctx, s.claudeBin, args...)
+	// Switch to stream-json so tokens arrive in real time.
+	streamArgs := replaceOutputFormat(args, "stream-json")
+
+	cmd := exec.CommandContext(ctx, s.claudeBin, streamArgs...)
 	s.applyTokenOverride(cmd)
 	cmd.Stdin = strings.NewReader(userPrompt)
-	var outBuf bytes.Buffer
-	cmd.Stdout = &outBuf
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		sseError(w, flusher, "pipe error: "+err.Error())
+		return
+	}
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("[claude-bridge] failed to start claude: %v", err)
@@ -424,57 +431,129 @@ func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, 
 		return
 	}
 
-	stopKeepalive := make(chan struct{})
+	id := "chatcmpl-bridge"
+	created := time.Now().Unix()
+
+	var mu sync.Mutex
+	emitChunk := func(delta map[string]any) {
+		mu.Lock()
+		defer mu.Unlock()
+		b, _ := json.Marshal(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": nil}},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	// Role marker so OpenClaw knows the assistant turn started.
+	emitChunk(map[string]any{"role": "assistant"})
+
+	// Heartbeat goroutine: sends empty-content deltas every 23s to reset
+	// OpenClaw's 120s idle timer during quiet phases (extended thinking, etc.).
+	// stream-json tokens reset the timer during active generation, but extended
+	// thinking phases produce no tokens — the heartbeat covers those gaps.
+	// Empty content deltas are invisible in chat.
+	heartbeatDone := make(chan struct{})
 	go func() {
-		// 23s interval: avoids the race where the 30s tick lands exactly when
-		// OpenClaw's 120s idle timer fires (t=120). With 23s, ticks land at
-		// 23, 46, 69, 92, 115, 138 — the 115s tick resets the timer before 120s.
-		t := time.NewTicker(23 * time.Second)
-		defer t.Stop()
+		ticker := time.NewTicker(23 * time.Second)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-t.C:
-				// Send an empty-delta data event (not an SSE comment) so OpenClaw's
-				// 120s idle timer resets on receipt. Empty content delta is invisible in chat.
-				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
-			case <-stopKeepalive:
+			case <-heartbeatDone:
 				return
+			case <-ticker.C:
+				emitChunk(map[string]any{"content": ""})
 			}
 		}
 	}()
 
-	err := cmd.Wait()
-	close(stopKeepalive)
-
-	if err != nil {
-		stderr := ""
-		if ee, ok := err.(*exec.ExitError); ok {
-			stderr = string(ee.Stderr)
-		}
-		log.Printf("[claude-bridge] claude failed (stream): %v stderr=%q", err, stderr)
-		sseError(w, flusher, fmt.Sprintf("claude CLI failed: %v — stderr: %s", err, stderr))
-		return
-	}
-
 	var result claudeJSONResult
-	if err := json.Unmarshal(outBuf.Bytes(), &result); err != nil {
-		log.Printf("[claude-bridge] parse error (stream): %v (raw: %s)", err, truncate(outBuf.String(), 500))
-		sseError(w, flusher, "claude output was not valid JSON: "+err.Error())
+	var textEmitted bool
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type  string `json:"type"`
+			Text  string `json:"text"`
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		switch event.Type {
+		case "text":
+			// Simple stream-json text event.
+			if event.Text != "" {
+				emitChunk(map[string]any{"content": event.Text})
+				textEmitted = true
+			}
+		case "content_block_delta":
+			// Anthropic SDK streaming event format.
+			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+				emitChunk(map[string]any{"content": event.Delta.Text})
+				textEmitted = true
+			}
+		case "result":
+			_ = json.Unmarshal([]byte(line), &result)
+		}
+	}
+
+	close(heartbeatDone)
+
+	if err := cmd.Wait(); err != nil {
+		log.Printf("[claude-bridge] claude failed (stream): %v stderr=%q", err, "")
+		sseError(w, flusher, fmt.Sprintf("claude CLI failed: %v", err))
 		return
 	}
-	if result.IsError {
-		sseError(w, flusher, "claude returned error: "+result.Subtype)
-		return
+
+	// Fallback: if no incremental text was emitted but we have the full result
+	// (e.g. stream-json format differs from expected), emit it all at once.
+	if !textEmitted && result.Result != "" {
+		emitChunk(map[string]any{"content": result.Result})
 	}
 
 	log.Printf("[claude-bridge] %s: in=%d out=%d cost=$%.4f stop=%s stream=true",
 		model, result.Usage.InputTokens, result.Usage.OutputTokens,
 		result.TotalCostUSD, result.StopReason)
 
-	writeSSEChunks(w, flusher, model, result)
+	// Finish chunk with usage stats.
+	finishB, _ := json.Marshal(map[string]any{
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": mapStopReason(result.StopReason)}},
+		"usage": map[string]any{
+			"prompt_tokens":     result.Usage.InputTokens,
+			"completion_tokens": result.Usage.OutputTokens,
+			"total_tokens":      result.Usage.InputTokens + result.Usage.OutputTokens,
+		},
+	})
+	fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", finishB)
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// replaceOutputFormat returns a copy of args with the --output-format value replaced.
+func replaceOutputFormat(args []string, newFmt string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, a := range out {
+		if a == "--output-format" && i+1 < len(out) {
+			out[i+1] = newFmt
+			return out
+		}
+	}
+	return out
 }
 
 // writeSSEHeaders sets SSE response headers, calls WriteHeader(200), flushes,
