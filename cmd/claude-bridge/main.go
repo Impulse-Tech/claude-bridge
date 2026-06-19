@@ -219,7 +219,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
 	defer cancel()
 
 	if req.Stream {
@@ -337,7 +337,7 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
 	defer cancel()
 
 	if raw.Stream {
