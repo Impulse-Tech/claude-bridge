@@ -131,7 +131,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
-	ids := []string{"sonnet", "opus", "haiku", "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"}
+	ids := []string{"sonnet", "opus", "haiku", "claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"}
 	data := make([]map[string]any, len(ids))
 	for i, id := range ids {
 		data[i] = map[string]any{
