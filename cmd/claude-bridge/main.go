@@ -28,6 +28,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -420,6 +421,9 @@ func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, 
 	s.applyTokenOverride(cmd)
 	cmd.Stdin = strings.NewReader(userPrompt)
 
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		sseError(w, flusher, "pipe error: "+err.Error())
@@ -513,8 +517,9 @@ func (s *server) runClaudeStreaming(w http.ResponseWriter, ctx context.Context, 
 	close(heartbeatDone)
 
 	if err := cmd.Wait(); err != nil {
-		log.Printf("[claude-bridge] claude failed (stream): %v stderr=%q", err, "")
-		sseError(w, flusher, fmt.Sprintf("claude CLI failed: %v", err))
+		stderr := stderrBuf.String()
+		log.Printf("[claude-bridge] claude failed (stream): %v stderr=%q", err, stderr)
+		sseError(w, flusher, fmt.Sprintf("claude CLI failed: %v — stderr: %s", err, stderr))
 		return
 	}
 
